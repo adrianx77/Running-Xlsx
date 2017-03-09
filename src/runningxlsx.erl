@@ -4,25 +4,34 @@
 
 %% Application callbacks
 -export([start/2, stop/1]).
--export([lookup/2,get/3]).
+-export([lookup/2]).
 %% ===================================================================
 %% Application callbacks
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
-    runningxlsx_sup:start_link().
+	Dir = "deps/xlsxio/xlsx",
+    runningxlsx_sup:start_link(Dir).
 
 stop(_State) ->
     ok.
 
-
 lookup(Table,MatchFun)when is_function(MatchFun)->
-	[object];
+	case xlsx_holder:current_root() of
+		undefined->[];
+		RootId->
+			case ets:lookup(RootId,Table) of
+				[]->[];
+				[{_,TabId,_Fields}]-> ets:match(TabId,MatchFun)
+		    end
+	end;
 lookup(Table,Key)->
-	[object].
+	case xlsx_holder:current_root() of
+		undefined->[];
+		RootId->
+			case ets:lookup(RootId,Table) of
+				[]->[];
+				[{_,TabId,_Fields}]-> ets:lookup(TabId,Key)
+			end
+	end.
 
-
-get(Table,MatchFun,RetFields)when is_function(MatchFun)->
-	[fields];
-get(Table,Key,RetFields)->
-	[].

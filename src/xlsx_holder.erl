@@ -8,11 +8,10 @@
 %%%-------------------------------------------------------------------
 -module(xlsx_holder).
 -author("Adrianx Lau <adrianx.lau@gmail.com>").
--include("../include/runningxlsx.hrl").
 -behaviour(gen_server).
 
 %% API
--export([start_link/1]).
+-export([start_link/1,current_root/0]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -24,24 +23,31 @@
 
 -define(SERVER, ?MODULE).
 -define(CHECK_CONFIG_DATA,{check_config}).
--record(xlsx_field,	{column,name,type}).
--record(xlsx_header,{table,fields}).
--record(state, {}).
+-define(CHECK_INTERVAL,10000).
+-define(ROOT_TABLE,'running_root_table').
+-define(RUNNING_TABLES_TABLE,'running_tables_ets').
+-record(xlsx_field,	{column,name,type,descript}).
+-record(xlsx_header,{table,fields,tabid}).
+-record(state, {dir,file_list_table}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-
+current_root()->
+	case ets:lookup(?ROOT_TABLE,root) of
+		[]-> undefined;
+		[{root,RootId}]-> RootId
+	end.
 %%--------------------------------------------------------------------
 %% @doc
 %% Starts the server
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(RXOpt :: tuple()) ->
+-spec(start_link(RXOpt :: term()) ->
 	{ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(RXOpt) ->
-	gen_server:start_link({local, ?SERVER}, ?MODULE, RXOpt, []).
+start_link(Dir) ->
+	gen_server:start_link({local, ?SERVER}, ?MODULE, Dir, []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -61,8 +67,11 @@ start_link(RXOpt) ->
 -spec(init(Args :: term()) ->
 	{ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
 	{stop, Reason :: term()} | ignore).
-init(#rx_option{dir=Dir,ignore = Ignore}=RxOpt) ->
-	{ok, #state{}}.
+init(Dir) ->
+	ets:new(?ROOT_TABLE,[set,named_table,protected]),
+	FilesTime = flush_dir(Dir,[]),
+	timer:send_after(?CHECK_INTERVAL,?CHECK_CONFIG_DATA),
+	{ok, #state{file_list_table = FilesTime,dir = Dir}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -110,8 +119,10 @@ handle_cast(_Request, State) ->
 	{noreply, NewState :: #state{}} |
 	{noreply, NewState :: #state{}, timeout() | hibernate} |
 	{stop, Reason :: term(), NewState :: #state{}}).
-handle_info(?CHECK_CONFIG_DATA,State)->
-	{noreply,State};
+handle_info(?CHECK_CONFIG_DATA,State=#state{dir=Dir,file_list_table = FilesTime})->
+	NewFilesTime =flush_dir(Dir,FilesTime),
+	timer:send_after(?CHECK_INTERVAL,?CHECK_CONFIG_DATA),
+	{noreply,State#state{file_list_table = NewFilesTime}};
 handle_info(_Info, State) ->
 	{noreply, State}.
 
@@ -148,22 +159,223 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-init(Dir,Ignore)->
-	o.
+flush_dir(Dir,OldFilesTime)->
+	case check_timeout(Dir,OldFilesTime) of
+		false-> OldFilesTime;
+		true->
+			RootId = ets:new(?RUNNING_TABLES_TABLE, [set, protected]),
+			Wild = filename:absname_join(Dir,"*.{xlsx,xlsm}"),
+			Files = filelib:wildcard(Wild),
+			try
+				NewFilesTime = lists:foldl(
+					fun(File,FilesTime)->
+						import_file(File, RootId),
+						Time = runningxlsx_util:get_fileunixtime(File),
+						[{File,Time}|FilesTime]
+					end,[],Files),
+				case ets:lookup(?ROOT_TABLE, root) of
+					[]->ets:insert(?ROOT_TABLE, {root, RootId});
+					[{root, OldRootId}]->ets:insert(?ROOT_TABLE, {root, RootId}), clear_root(OldRootId)
+				end,
+				NewFilesTime
+			catch
+			    E:R  ->
+				    io:format("~p:~p~n",[E,R]),
+				    clear_root(RootId),
+				    OldFilesTime
+			end
+	end.
 
-import_file(File,DataBegin)->
-	LineFun = fun(TabName,[1|Row],_Context)->
-				{next_row,};
-				(TabName,[Line|Row]) when Line>=DataBegin->
-				Row
+check_timeout(Dir,OldFilesTime)->
+	Wild = filename:absname_join(Dir,"*.{xlsx,xlsm}"),
+	Files = filelib:wildcard(Wild),
+	NewFileTime = lists:filtermap(
+		fun(File)->
+			case filename:basename(File) of
+				"~$"++_->
+					false;
+				_Base ->
+					FileTime = runningxlsx_util:get_fileunixtime(File),
+					{true,{File,FileTime}}
+			end
+		end,Files),
+	Diff = (OldFilesTime--NewFileTime) ++ (NewFileTime -- OldFilesTime),
+	if length(Diff) >0 -> true;
+		true-> false
+	end.
+
+clear_root(RootId)->
+	TabList = ets:tab2list(RootId),
+	lists:foreach(fun({_TabName,TabId,_})-> ets:delete(TabId) end,TabList),
+	ets:delete(RootId).
+
+import_file(File,RootId)->
+	LineFun =
+		fun(ThisTab,[1|Row],#xlsx_header{table = LastTable,tabid = TabId,fields = FieldList})->
+				push_table(RootId,LastTable,TabId,FieldList),
+				Fields = process_header([],1,Row),
+				TabName = list_to_atom(ThisTab),
+				NewTabId = ets:new(TabName,[set,protected]),
+				NewContext = #xlsx_header{table = TabName,fields = Fields,tabid = NewTabId},
+				{next_row,NewContext};
+			(ThisTab,[1|Row],_)->
+				Fields = process_header([],1,Row),
+				TabName = list_to_atom(ThisTab),
+				NewTabId = ets:new(TabName,[set,protected]),
+				NewContext = #xlsx_header{table = TabName,fields = Fields,tabid = NewTabId},
+				{next_row,NewContext};
+			(_TabName,[2|Row],Context=#xlsx_header{fields = Fields})->
+				NewFields = process_header(Fields,2,Row),
+				{next_row,Context#xlsx_header{fields = NewFields}};
+			(_TabName,[3|Row],Context=#xlsx_header{fields = Fields})->
+				NewFields = process_header(Fields,3,Row),
+				{next_row,Context#xlsx_header{fields = NewFields}};
+			(_TabName,[Line|Row],Context=#xlsx_header{fields = Fields,tabid = TabId})->
+				process_data(TabId,Fields,Line,Row),
+				{next_row,Context}
 		end,
-	xlsx_reader:read(File,LineFun).
+	case xlsx_reader:read(File,undefined,LineFun) of
+		#xlsx_header{table = TableName1,tabid = TabId1,fields = FieldList} ->
+			push_table(RootId,TableName1,TabId1,FieldList);
+		Error-> runningxlsx_util:error("Read:~p~n",[Error])
+	end.
 
-process_header(Table,Row)->
-	TabId = ets:new(list_to_atom(Table),[set,protected]),
-	lists:foldl(
-		fun(FieldInfo,{I,AccIn})->
-			Field = case string:tokens(FieldInfo,":") of
-				[FieldName,Type]-> #xlsx_field{column = I,name = FieldName,type = Type}
-			end,
-		{I+1,[Field|AccIn]} end ,{1,[]},Row).
+
+push_table(RootId,TableName,TabId,FieldList)->
+	ets:insert(RootId,{TableName,TabId,FieldList}).
+
+process_header(_,1,Row)->
+	NewRow = lists:zip(lists:seq(1,length(Row)),Row),
+	lists:filtermap(
+		fun({_,[]})->
+			false;
+			({Indx,Cell})->
+				{true,#xlsx_field{column = Indx,name = Cell}}
+		end,NewRow);
+process_header(HeaderInfos,2,Row)->
+	NewRow = lists:zip(lists:seq(1,length(Row)),Row),
+	lists:map(
+		fun(#xlsx_field{column = ColIndx}=HeaderInfo)->
+			case lists:keyfind(ColIndx,1,NewRow) of
+				false->
+					HeaderInfo;
+				{_,[]}->
+					HeaderInfo#xlsx_field{type = string};
+				{_,"integer"}->
+					HeaderInfo#xlsx_field{type = integer};
+				{_,"integer_list"}->
+					HeaderInfo#xlsx_field{type = integer_list};
+				{_,"float"}->
+					HeaderInfo#xlsx_field{type = float};
+				{_,"float_list"}->
+					HeaderInfo#xlsx_field{type = float_list};
+				{_,"tuple"}->
+					HeaderInfo#xlsx_field{type = tuple};
+				{_,"tuple_list"}->
+					HeaderInfo#xlsx_field{type = tuple_list};
+				{_,"string"}->
+					HeaderInfo#xlsx_field{type = string};
+				{_,"string_list"}->
+					HeaderInfo#xlsx_field{type = string_list};
+				{_,"atom"}->
+					HeaderInfo#xlsx_field{type = atom};
+				{_,"atom_list"}->
+					HeaderInfo#xlsx_field{type = atom_list};
+				{_,"binary"}->
+					HeaderInfo#xlsx_field{type = binary};
+				{_,"binary_list"}->
+					HeaderInfo#xlsx_field{type = binary_list};
+				{_,"list"}->
+					HeaderInfo#xlsx_field{type = list};
+				{_,_}->
+					HeaderInfo#xlsx_field{type = unknown}
+			end
+		end,HeaderInfos);
+process_header(HeaderInfos,3,Row)->
+	NewRow = lists:zip(lists:seq(1,length(Row)),Row),
+	lists:map(
+		fun(#xlsx_field{column = ColIndx}=HeaderInfo)->
+			case lists:keyfind(ColIndx,1,NewRow) of
+				false->
+					HeaderInfo;
+				{_,Cell}->
+					HeaderInfo#xlsx_field{descript = Cell}
+			end
+		end,HeaderInfos).
+
+process_data(_Tab,[],_,_)->
+	ok;
+process_data(Tab,HeaderInfos,Line,Row)->
+	NewRow = lists:zip(lists:seq(1, length(Row)), Row),
+	EtsLine = lists:filtermap(
+		fun({I, Cell})->
+			case lists:keyfind(I, #xlsx_field.column, HeaderInfos) of
+				false->false;
+				#xlsx_field{type = integer}->
+					{true, list_to_integer(Cell)};
+				#xlsx_field{type = integer_list}->
+					{ok,List} = runningxlsx_util:string_to_integer_list(Cell),
+					case runningxlsx_util:check_list(List,integer) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate integer list:(~p,~p)",[Line,I])
+					end;
+
+				#xlsx_field{type = float}->
+					case runningxlsx_util:string_to_float(Cell) of
+						{ok,Flt}->{true,Flt};
+						{error,_}->runningxlsx_util:error("invalidate float list:(~p,~p)",[Line,I])
+					end;
+				#xlsx_field{type = float_list}->
+					{ok,List} = runningxlsx_util:string_to_float_list(Cell),
+					case runningxlsx_util:check_list(List,float) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate float list:(~p,~p)",[Line,I])
+					end;
+
+				#xlsx_field{type = string}->
+					{true, Cell};
+				#xlsx_field{type = string_list}->
+					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					case runningxlsx_util:check_list(List,string) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate string list:(~p,~p)",[Line,I])
+					end;
+
+				#xlsx_field{type = atom}->
+					{true, list_to_atom(Cell)};
+				#xlsx_field{type = atom_list}->
+					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					case runningxlsx_util:check_list(List,atom) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate atom list:(~p,~p)",[Line,I])
+					end;
+				#xlsx_field{type = binary}->
+					{true, list_to_binary(Cell)};
+				#xlsx_field{type = binary_list}->
+					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					case runningxlsx_util:check_list(List,binary) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate binary list:(~p,~p)",[Line,I])
+					end;
+				#xlsx_field{type = tuple}->
+					{ok,Tuple} = runningxlsx_util:string_to_term(Cell),
+					if is_tuple(Tuple)->
+						{true, Tuple};
+						true->
+							runningxlsx_util:error("invalidate tuple :(~p,~p)",[Line,I])
+					end;
+				#xlsx_field{type = tuple_list}->
+					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					case runningxlsx_util:check_list(List,tuple) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate tuple list:(~p,~p)",[Line,I])
+					end;
+				#xlsx_field{type = list}->
+					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					case runningxlsx_util:check_list(List,any) of
+						true-> {true, List};
+						false-> runningxlsx_util:error("invalidate any list:(~p,~p)",[Line,I])
+					end
+			end
+		end, NewRow),
+	ets:insert(Tab, list_to_tuple(EtsLine)).
