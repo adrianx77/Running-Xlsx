@@ -68,7 +68,7 @@ start_link(Dir) ->
 	{ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
 	{stop, Reason :: term()} | ignore).
 init(Dir) ->
-	ets:new(?ROOT_TABLE,[set,named_table,protected]),
+	ets:new(?ROOT_TABLE,[set,named_table,protected,{read_concurrency,true}]),
 	FilesTime = flush_dir(Dir,[]),
 	timer:send_after(?CHECK_INTERVAL,?CHECK_CONFIG_DATA),
 	{ok, #state{file_list_table = FilesTime,dir = Dir}}.
@@ -163,7 +163,7 @@ flush_dir(Dir,OldFilesTime)->
 	case check_timeout(Dir,OldFilesTime) of
 		false-> OldFilesTime;
 		true->
-			RootId = ets:new(?RUNNING_TABLES_TABLE, [set, protected]),
+			RootId = ets:new(?RUNNING_TABLES_TABLE, [set, protected,{read_concurrency,true}]),
 			Wild = filename:absname_join(Dir,"*.{xlsx,xlsm}"),
 			Files = filelib:wildcard(Wild),
 			try
@@ -215,13 +215,13 @@ import_file(File,RootId)->
 				push_table(RootId,LastTable,TabId,FieldList),
 				Fields = process_header([],1,Row),
 				TabName = list_to_atom(ThisTab),
-				NewTabId = ets:new(TabName,[set,protected]),
+				NewTabId = ets:new(TabName,[set,protected,{read_concurrency,true}]),
 				NewContext = #xlsx_header{table = TabName,fields = Fields,tabid = NewTabId},
 				{next_row,NewContext};
 			(ThisTab,[1|Row],_)->
 				Fields = process_header([],1,Row),
 				TabName = list_to_atom(ThisTab),
-				NewTabId = ets:new(TabName,[set,protected]),
+				NewTabId = ets:new(TabName,[set,protected,{read_concurrency,true}]),
 				NewContext = #xlsx_header{table = TabName,fields = Fields,tabid = NewTabId},
 				{next_row,NewContext};
 			(_TabName,[2|Row],Context=#xlsx_header{fields = Fields})->
