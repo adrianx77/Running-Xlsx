@@ -4,14 +4,13 @@
 
 %% Application callbacks
 -export([start/2, stop/1]).
--export([lookup/2]).
+-export([tables/0,lookup/2]).
 %% ===================================================================
 %% Application callbacks
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
-	Dir = "deps/xlsxio/xlsx",
-    runningxlsx_sup:start_link(Dir).
+    runningxlsx_sup:start_link().
 
 stop(_State) ->
     ok.
@@ -35,3 +34,10 @@ lookup(Table,Key)->
 			end
 	end.
 
+
+tables()->
+	case xlsx_holder:current_root() of
+		undefined->[];
+		RootId-> List = ets:tab2list(RootId),
+				lists:map(fun({Table,_,_})-> Table end,List)
+	end.

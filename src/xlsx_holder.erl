@@ -11,7 +11,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1,current_root/0]).
+-export([start_link/0,current_root/0]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -44,10 +44,10 @@ current_root()->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(RXOpt :: term()) ->
+-spec(start_link() ->
 	{ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(Dir) ->
-	gen_server:start_link({local, ?SERVER}, ?MODULE, Dir, []).
+start_link() ->
+	gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -67,8 +67,9 @@ start_link(Dir) ->
 -spec(init(Args :: term()) ->
 	{ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
 	{stop, Reason :: term()} | ignore).
-init(Dir) ->
+init([]) ->
 	ets:new(?ROOT_TABLE,[set,named_table,protected,{read_concurrency,true}]),
+	{ok,Dir} = application:get_env(xlsx_dir),
 	FilesTime = flush_dir(Dir,[]),
 	timer:send_after(?CHECK_INTERVAL,?CHECK_CONFIG_DATA),
 	{ok, #state{file_list_table = FilesTime,dir = Dir}}.
@@ -165,7 +166,14 @@ flush_dir(Dir,OldFilesTime)->
 		true->
 			RootId = ets:new(?RUNNING_TABLES_TABLE, [set, protected,{read_concurrency,true}]),
 			Wild = filename:absname_join(Dir,"*.{xlsx,xlsm}"),
-			Files = filelib:wildcard(Wild),
+			Files0 = filelib:wildcard(Wild),
+			Files =lists:filter(
+					fun(F)->
+						case filename:basename(F) of
+							"~$"++_-> false;
+							_-> true
+						end
+					end,Files0),
 			try
 				NewFilesTime = lists:foldl(
 					fun(File,FilesTime)->
@@ -237,7 +245,8 @@ import_file(File,RootId)->
 	case xlsx_reader:read(File,undefined,LineFun) of
 		#xlsx_header{table = TableName1,tabid = TabId1,fields = FieldList} ->
 			push_table(RootId,TableName1,TabId1,FieldList);
-		Error-> runningxlsx_util:error("Read:~p~n",[Error])
+		Error->
+			runningxlsx_util:error("Read:~p~n",[Error])
 	end.
 
 
@@ -333,9 +342,9 @@ process_data(Tab,HeaderInfos,Line,Row)->
 					end;
 
 				#xlsx_field{type = string}->
-					{true, Cell};
+					{true, binary_to_list(unicode:characters_to_binary(Cell))};
 				#xlsx_field{type = string_list}->
-					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					{ok,List} = runningxlsx_util:string_to_term(binary_to_list(unicode:characters_to_binary(Cell))),
 					case runningxlsx_util:check_list(List,string) of
 						true-> {true, List};
 						false-> runningxlsx_util:error("invalidate string list:(~p,~p)",[Line,I])
@@ -350,28 +359,29 @@ process_data(Tab,HeaderInfos,Line,Row)->
 						false-> runningxlsx_util:error("invalidate atom list:(~p,~p)",[Line,I])
 					end;
 				#xlsx_field{type = binary}->
-					{true, list_to_binary(Cell)};
+					{true, unicode:characters_to_binary(Cell)};
 				#xlsx_field{type = binary_list}->
-					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					C0 = binary_to_list(unicode:characters_to_binary(Cell)),
+					{ok,List} = runningxlsx_util:string_to_term(C0),
 					case runningxlsx_util:check_list(List,binary) of
 						true-> {true, List};
 						false-> runningxlsx_util:error("invalidate binary list:(~p,~p)",[Line,I])
 					end;
 				#xlsx_field{type = tuple}->
-					{ok,Tuple} = runningxlsx_util:string_to_term(Cell),
+					{ok,Tuple} = runningxlsx_util:string_to_term(binary_to_list(unicode:characters_to_binary(Cell))),
 					if is_tuple(Tuple)->
 						{true, Tuple};
 						true->
 							runningxlsx_util:error("invalidate tuple :(~p,~p)",[Line,I])
 					end;
 				#xlsx_field{type = tuple_list}->
-					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					{ok,List} = runningxlsx_util:string_to_term(binary_to_list(unicode:characters_to_binary(Cell))),
 					case runningxlsx_util:check_list(List,tuple) of
 						true-> {true, List};
 						false-> runningxlsx_util:error("invalidate tuple list:(~p,~p)",[Line,I])
 					end;
 				#xlsx_field{type = list}->
-					{ok,List} = runningxlsx_util:string_to_term(Cell),
+					{ok,List} = runningxlsx_util:string_to_term(binary_to_list(unicode:characters_to_binary(Cell))),
 					case runningxlsx_util:check_list(List,any) of
 						true-> {true, List};
 						false-> runningxlsx_util:error("invalidate any list:(~p,~p)",[Line,I])

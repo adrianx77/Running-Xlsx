@@ -3,7 +3,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/1]).
+-export([start_link/0]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -15,15 +15,15 @@
 %% API functions
 %% ===================================================================
 
-start_link(Dir) ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, [Dir]).
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 %% ===================================================================
 %% Supervisor callbacks
 %% ===================================================================
 
-init([Dir]) ->
+init([]) ->
 
-    Child = ?CHILD_SPEC(xlsx_holder,xlsx_holder,worker,[Dir]),
+    Child = ?CHILD_SPEC(xlsx_holder,xlsx_holder,worker,[]),
     {ok, { {one_for_one, 5, 10}, [Child]} }.
 
